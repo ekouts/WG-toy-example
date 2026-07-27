@@ -48,6 +48,28 @@ def stop_memory_history():
         torch.cuda.memory._record_memory_history(enabled=None)
 
 
+def reset_peak_memory():
+    """Zero the allocator's peak counters so the report covers the loop only."""
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.reset_peak_memory_stats()
+
+
+def report_peak_memory():
+    """Print the high-water marks of the CUDA caching allocator.
+
+    allocated = memory actually held by live tensors; reserved = memory the
+    allocator took from the driver, so reserved - allocated is cache/fragmentation.
+    """
+    if not torch.cuda.is_available():
+        return
+    gib = 1024**3
+    print(
+        f"peak memory: allocated {torch.cuda.max_memory_allocated() / gib:.3f} GiB, "
+        f"reserved {torch.cuda.max_memory_reserved() / gib:.3f} GiB"
+    )
+
+
 def build_dataloader():
     x = torch.randn(NUM_SAMPLES, IN_FEATURES)
     y = torch.randn(NUM_SAMPLES, OUT_FEATURES)
@@ -70,6 +92,7 @@ def train():
     optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 
     model.train()
+    reset_peak_memory()
     start_memory_history()
     try:
         for epoch in range(NUM_EPOCHS):
@@ -89,6 +112,7 @@ def train():
     finally:
         # in finally so an OOM -- the usual reason for recording -- still dumps
         stop_memory_history()
+        report_peak_memory()
 
     return model
 
