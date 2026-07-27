@@ -17,7 +17,7 @@ NUM_SAMPLES = 128
 BATCH_SIZE = 1
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-2
-DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 0
 
 RECORD_MEMORY_HISTORY = False
