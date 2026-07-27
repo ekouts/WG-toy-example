@@ -9,8 +9,9 @@ memory and profiling experiments can be tried here before porting to
 
 - `train.py` — the whole pipeline: config knobs at the top of the module, then
   `build_dataloader()`, `build_model()`, `train()`.
+- `generate_healpix_data.py` — synthetic HEALPix input resembling WG's (see `README.md`).
 - `agent_docs/` — detailed notes, indexed below. Not auto-loaded; read when relevant.
-- `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch).
+- `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch, numpy, astropy-healpix).
 
 Flat by design. Don't add package structure, config frameworks or abstraction layers
 unless the repo actually outgrows a single file.
@@ -30,6 +31,10 @@ diff by eye.
 `uv sync`, then `uv run python train.py`. Never `pip install` into the env — it
 bypasses the lock. Defaults are CPU-only and finish in seconds; keep it that way, and
 put anything GPU-specific behind the `DEVICE` knob.
+
+This repo sits nested inside a WeatherGenerator checkout, whose `[tool.uv]`
+`exclude-newer` setting leaks in and breaks torch resolution. Pass `--no-config` to
+uv commands that resolve (`uv lock` / `uv sync`), and use uv >= 0.10.
 
 ## Keeping context current
 
