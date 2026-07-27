@@ -21,10 +21,13 @@ Two levels of fidelity are provided:
    non-degenerate.
 
 2. ``tokenize_to_cells()`` -- groups the points into the cells of a (coarser) model
-   HEALPix level and packs them into per-cell token tensors, mirroring what the WG
-   tokenizer stores in ``StreamData``:
-       source_tokens_cells : (num_cells, max_tokens_per_cell, token_size, num_channels)
-       source_tokens_lens  : (num_cells,)  -- tokens per cell without padding
+   HEALPix level and packs them into token tensors, mirroring the model input observed
+   in a real batch (see ``agent_docs/dataloader-batch-anatomy.md``):
+       source_tokens_cells : (total_tokens, token_size, num_channels)
+           tokens of all cells concatenated in cell order (``layout="packed"``, default;
+           ``layout="padded"`` gives (num_cells, max_tokens_per_cell, token_size,
+           num_channels) instead)
+       source_tokens_lens  : (num_cells,)  -- tokens per cell, maps tokens back to cells
    Per-point channels are [time_enc(5), lat_norm, lon_norm, geoinfos..., data...],
    analogous to the real pipeline (time embedding + coords + geoinfos + physical data).
 
@@ -184,17 +187,23 @@ def tokenize_to_cells(
     healpix_level: int = 5,
     token_size: int = 8,
     time_win: tuple[np.datetime64, np.datetime64] | None = None,
+    layout: str = "packed",
     as_torch: bool = False,
 ):
     """Pack point data into per-cell token tensors as the WG tokenizer does.
 
     Points are assigned to nested HEALPix cells at ``healpix_level``, sorted by cell,
     and chunked into tokens of ``token_size`` points (the last token of a cell is
-    zero-padded, as is any cell with fewer tokens than the fullest cell).
+    zero-padded).
 
     Returns
     -------
-    source_tokens_cells : (num_cells, max_tokens_per_cell, token_size, num_channels)
+    source_tokens_cells :
+        ``layout="packed"`` (default, matches the model input observed in a real WG
+        batch, see agent_docs/dataloader-batch-anatomy.md):
+        (total_tokens, token_size, num_channels), tokens of all cells concatenated in
+        cell order. ``layout="padded"``: (num_cells, max_tokens_per_cell, token_size,
+        num_channels), cells with fewer tokens zero-padded.
         num_channels = 5 (time enc) + 2 (lat, lon normalized) + geoinfos + data.
     source_tokens_lens : (num_cells,) int32, tokens per cell without padding.
     """
@@ -224,18 +233,27 @@ def tokenize_to_cells(
     counts = np.bincount(cell_idx, minlength=num_cells)
 
     tokens_per_cell = (counts + token_size - 1) // token_size
-    max_tokens = int(tokens_per_cell.max()) if len(tokens_per_cell) else 0
-
-    source_tokens_cells = np.zeros(
-        (num_cells, max_tokens, token_size, num_channels), dtype=np.float32
-    )
     starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
-    for cell in np.flatnonzero(counts):
-        pts = features[starts[cell] : starts[cell] + counts[cell]]
-        n_tok = tokens_per_cell[cell]
+
+    # chunk each cell's points into zero-padded tokens
+    per_cell = []
+    for cell in range(num_cells):
+        n_tok = int(tokens_per_cell[cell])
         padded = np.zeros((n_tok * token_size, num_channels), dtype=np.float32)
-        padded[: len(pts)] = pts
-        source_tokens_cells[cell, :n_tok] = padded.reshape(n_tok, token_size, num_channels)
+        padded[: counts[cell]] = features[starts[cell] : starts[cell] + counts[cell]]
+        per_cell.append(padded.reshape(n_tok, token_size, num_channels))
+
+    if layout == "packed":
+        source_tokens_cells = np.concatenate(per_cell)
+    elif layout == "padded":
+        max_tokens = int(tokens_per_cell.max()) if len(tokens_per_cell) else 0
+        source_tokens_cells = np.zeros(
+            (num_cells, max_tokens, token_size, num_channels), dtype=np.float32
+        )
+        for cell, toks in enumerate(per_cell):
+            source_tokens_cells[cell, : len(toks)] = toks
+    else:
+        raise ValueError(f"unknown layout {layout!r}, expected 'packed' or 'padded'")
 
     source_tokens_lens = tokens_per_cell.astype(np.int32)
 
@@ -289,11 +307,12 @@ def main():
         )
 
     if args.out:
-        np.savez_compressed(
-            args.out,
-            source_tokens_cells=np.stack(all_tokens),
-            source_tokens_lens=np.stack(all_lens),
-        )
+        # one entry per step: packed token totals can differ between steps
+        arrays = {}
+        for i, (tokens, lens) in enumerate(zip(all_tokens, all_lens, strict=True)):
+            arrays[f"source_tokens_cells_{i}"] = tokens
+            arrays[f"source_tokens_lens_{i}"] = lens
+        np.savez_compressed(args.out, **arrays)
         print(f"saved to {args.out}")
 
 

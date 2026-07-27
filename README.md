@@ -11,10 +11,11 @@ training pipeline.
   1. `generate_toy_reader_data()`: point data in the layout of WG's `IOReaderData`
      (coords, geoinfos, data, datetimes), with points at nested HEALPix cell centers and
      smooth "weather-like" fields that evolve over time.
-  2. `tokenize_to_cells()`: packs the points into the per-cell token tensors the model ingests,
-     as stored in WG's `StreamData`:
-     `source_tokens_cells (num_cells, max_tokens_per_cell, token_size, num_channels)` and
-     `source_tokens_lens (num_cells,)`.
+  2. `tokenize_to_cells()`: packs the points into the token tensors the model ingests, matching
+     the layout observed in a real WG batch (`agent_docs/dataloader-batch-anatomy.md`):
+     `source_tokens_cells (total_tokens, token_size, num_channels)` — tokens of all cells
+     concatenated in cell order — and `source_tokens_lens (num_cells,)` mapping tokens back to
+     cells. `layout="padded"` gives the per-cell padded 4D variant instead.
 
 ## Requirements
 
