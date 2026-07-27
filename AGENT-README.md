@@ -9,7 +9,8 @@ memory and profiling experiments can be tried here before porting to
 
 - `train.py` — the whole pipeline: config knobs at the top of the module, then
   `build_dataloader()`, `build_model()`, `train()`.
-- `generate_healpix_data.py` — synthetic HEALPix input resembling WG's (see `README.md`).
+- `generate_healpix_data.py` — white-noise source tokens in WG's packed input layout,
+  plus HEALPix cell-center coordinates (see `README.md`).
 - `agent_docs/` — detailed notes, indexed below. Not auto-loaded; read when relevant.
 - `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch, numpy, astropy-healpix).
 
