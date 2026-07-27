@@ -42,6 +42,9 @@ below. Where code and docs disagree, trust the code and fix the docs.
 
 - `agent_docs/experiments.md` — log of experiments run here: what was tried, what the
   numbers were, what carried over to WeatherGenerator. Append when an experiment ends.
+- `agent_docs/dataloader-batch-anatomy.md` — interpretation of a real
+  WeatherGenerator `BatchSamples` dump, including tensor dimensions and per-stream
+  source/target contents.
 
 ## Rules
 
