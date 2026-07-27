@@ -14,11 +14,38 @@ from torch.utils.data import DataLoader, TensorDataset
 IN_FEATURES = 16
 OUT_FEATURES = 4
 NUM_SAMPLES = 128
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-2
 DEVICE = "cpu"
 SEED = 0
+
+RECORD_MEMORY_HISTORY = False
+MEMORY_SNAPSHOT_PATH = "memory_snapshot.pickle"
+# ring buffer of allocator events, not a time span: once it wraps, the snapshot
+# keeps only the tail of the run. Size it against the number of steps recorded.
+MEMORY_HISTORY_MAX_ENTRIES = 100_000
+
+
+def start_memory_history():
+    """Start the CUDA allocator trace. No-op unless recording is on and CUDA is here."""
+    if not (RECORD_MEMORY_HISTORY and torch.cuda.is_available()):
+        return
+    torch.cuda.memory._record_memory_history(max_entries=MEMORY_HISTORY_MAX_ENTRIES)
+    print(f"recording memory history (max_entries={MEMORY_HISTORY_MAX_ENTRIES})")
+
+
+def stop_memory_history():
+    """Dump the snapshot and stop recording. View at https://docs.pytorch.org/memory_viz."""
+    if not (RECORD_MEMORY_HISTORY and torch.cuda.is_available()):
+        return
+    try:
+        torch.cuda.memory._dump_snapshot(MEMORY_SNAPSHOT_PATH)
+        print(f"wrote memory snapshot to {MEMORY_SNAPSHOT_PATH}")
+    except Exception as e:  # a failed dump must not mask the training error
+        print(f"failed to write memory snapshot: {e}")
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def build_dataloader():
@@ -43,20 +70,25 @@ def train():
     optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 
     model.train()
-    for epoch in range(NUM_EPOCHS):
-        running_loss = 0.0
-        for x, y in dataloader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
+    start_memory_history()
+    try:
+        for epoch in range(NUM_EPOCHS):
+            running_loss = 0.0
+            for x, y in dataloader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
 
-            optimizer.zero_grad()
-            preds = model(x)
-            loss = criterion(preds, y)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                preds = model(x)
+                loss = criterion(preds, y)
+                loss.backward()
+                optimizer.step()
 
-            running_loss += loss.item() * x.size(0)
+                running_loss += loss.item() * x.size(0)
 
-        print(f"epoch {epoch}: loss {running_loss / NUM_SAMPLES:.4f}")
+            print(f"epoch {epoch}: loss {running_loss / NUM_SAMPLES:.4f}")
+    finally:
+        # in finally so an OOM -- the usual reason for recording -- still dumps
+        stop_memory_history()
 
     return model
 
