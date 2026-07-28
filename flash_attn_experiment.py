@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from flash_attn_interface import flash_attn_func
+from flash_attn import flash_attn_func
 
 # --- config ---------------------------------------------------------------
 # input is (batch, seqlen, DIM_EMBED); q/k/v come out as
