@@ -76,13 +76,14 @@ def build_qkv():
 def run():
     if not torch.cuda.is_available():
         raise RuntimeError("flash attention needs a CUDA device; none is visible")
+    start_memory_history()
 
     torch.manual_seed(SEED)
 
     q, k, v = build_qkv()
     # allocate the inputs before resetting, so the report covers the pass only
     torch.cuda.reset_peak_memory_stats()
-    start_memory_history()
+    
     try:
         out = flash_attn_func(q, k, v)
         # older flash_attn_interface builds return (out, softmax_lse)
@@ -90,7 +91,7 @@ def run():
             out = out[0]
 
         # stands in for a loss: any scalar will do, the gradients land on q/k/v
-        loss = out.float().pow(2).mean()
+        loss = out.mean()
         loss.backward()
 
         print(f"loss {loss.item():.6f}")
