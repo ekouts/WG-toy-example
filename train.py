@@ -20,6 +20,10 @@ LEARNING_RATE = 1e-2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 0
 
+# the memory tooling below is CUDA-only, so it follows DEVICE rather than mere
+# CUDA availability -- forcing DEVICE = "cpu" on a GPU box silences it too.
+ON_CUDA = torch.device(DEVICE).type == "cuda"
+
 RECORD_MEMORY_HISTORY = False
 MEMORY_SNAPSHOT_PATH = "memory_snapshot.pickle"
 # ring buffer of allocator events, not a time span: once it wraps, the snapshot
@@ -29,7 +33,7 @@ MEMORY_HISTORY_MAX_ENTRIES = 100_000
 
 def start_memory_history():
     """Start the CUDA allocator trace. No-op unless recording is on and CUDA is here."""
-    if not (RECORD_MEMORY_HISTORY and torch.cuda.is_available()):
+    if not (RECORD_MEMORY_HISTORY and ON_CUDA):
         return
     torch.cuda.memory._record_memory_history(max_entries=MEMORY_HISTORY_MAX_ENTRIES)
     print(f"recording memory history (max_entries={MEMORY_HISTORY_MAX_ENTRIES})")

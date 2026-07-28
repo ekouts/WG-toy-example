@@ -11,6 +11,9 @@ memory and profiling experiments can be tried here before porting to
   `build_dataloader()`, `build_model()`, `train()`.
 - `generate_healpix_data.py` — white-noise source tokens in WG's packed input layout,
   plus HEALPix cell-center coordinates (see `README.md`).
+- `flash_attn_experiment.py` — one `flash_attn_func` forward+backward on random q/k/v,
+  wrapped in an allocator trace that dumps `flash_attn_memory_snapshot.pickle`.
+  CUDA-only (FlashAttention-3), so it does not run on the CPU default.
 - `agent_docs/` — detailed notes, indexed below. Not auto-loaded; read when relevant.
 - `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch, numpy, astropy-healpix).
 
