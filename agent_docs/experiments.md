@@ -38,3 +38,24 @@ no source tokens because ERA5 input came from the separate `ERA5_in` stream.
 dataloader, memory, and model-input debugging. Keep the compact summary here and use
 the [full batch anatomy note](dataloader-batch-anatomy.md) for field-by-field details
 and follow-up checks.
+
+## 2026-07-28 — Slurm-native launch for `flash_attn_experiment_geo_parallelization.py`
+
+**Question:** How should the 4-GPU mask-partitioned flash-attention prototype launch on
+JURECA when `srun` already starts one task per GPU?
+
+**Setup:** `submission_file_jureca.sh` requests one node, four tasks, and four GPUs.
+Previous Slurm output showed each task saw one CUDA device, which made the old
+`torch.multiprocessing.spawn` entry point and per-process four-GPU check the wrong
+shape for this launch mode.
+
+**Result:** `flash_attn_experiment_geo_parallelization.py` now reads rank, local
+rank, and world size from Slurm/launcher environment variables, joins the NCCL
+process group directly,
+and selects `cuda:0` when Slurm exposes exactly one GPU per task. The JURECA batch
+script now exports only `MASTER_ADDR`/`MASTER_PORT` and runs
+`srun --export=ALL python flash_attn_experiment_geo_parallelization.py`.
+
+**Verdict:** Ready to rerun with `sbatch submission_file_jureca.sh`. This edit was
+syntax-checked only; it still needs verification inside a GPU allocation.
+

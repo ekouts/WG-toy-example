@@ -17,6 +17,10 @@ memory and profiling experiments can be tried here before porting to
   timestamped `flash_attn_memory_snapshot_*.pickle`. `CHECKPOINT_PROLOGUE` toggles
   activation checkpointing of the prologue, and tags the snapshot name with the mode.
   CUDA-only (FlashAttention-3), so it does not run on the CPU default.
+- `flash_attn_experiment_geo_parallelization.py` — 4-GPU mask-partitioned version of
+  the flash-attn prologue experiment. Launch with Slurm `srun`, one Python process
+  per GPU; ranks come from Slurm environment variables rather than
+  `torch.multiprocessing.spawn`.
 - `agent_docs/` — detailed notes, indexed below. Not auto-loaded; read when relevant.
 - `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch, numpy, astropy-healpix).
 
