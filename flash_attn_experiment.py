@@ -1,8 +1,17 @@
-"""One flash_attn_func call, forward + backward, memory-profiled.
+"""WeatherGenerator's attention prologue + one flash_attn_func call, memory-profiled.
 
-No model, no optimizer: q/k/v are leaf tensors fed straight to the kernel, so
-the allocator trace contains the attention call and nothing else. The point of
-this file is the pickle it drops, not the loss it prints.
+Forward + backward over the part of `MultiSelfAttentionHead*.forward` that feeds
+the kernel: three head projections off the same input, RMSNorm on q and k, then
+`flash_attn_func`. No output projection, no residual -- the point of this file is
+the pickle it drops, not the loss it prints.
+
+Shapes and modules mirror `WeatherGenerator/src/weathergen/model/attention.py`
+(and `norms.py`); `RMSNorm` is copied here rather than imported so this sandbox
+keeps its torch-only dependency set.
+
+Everything runs in bf16 with no autocast, so the `.to(self.dtype)` casts WG needs
+under autocast are no-ops here -- see `norm_in_input_dtype` in WG's `norms.py` for
+what those casts are worth once autocast is on.
 
 FlashAttention-3 (`flash_attn_interface`) is CUDA-only and wants a Hopper GPU,
 so unlike train.py this script has no CPU fallback.
@@ -10,19 +19,32 @@ so unlike train.py this script has no CPU fallback.
 View the snapshot at https://docs.pytorch.org/memory_viz.
 """
 
+import time
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from flash_attn_interface import flash_attn_func
 
 # --- config ---------------------------------------------------------------
-# flash_attn_func's dense layout: (batch, seqlen, heads, head_dim)
-QKV_SHAPE = (7958, 30, 2, 128)
+# input is (batch, seqlen, DIM_EMBED); q/k/v come out as
+# (batch, seqlen, NUM_HEADS, DIM_HEAD_PROJ) = (7958, 30, 2, 128), which is
+# flash_attn_func's dense layout
+BATCH_SIZE = 7958
+SEQ_LEN = 30
+DIM_EMBED = 512
+NUM_HEADS = 2
+# proj_heads_* is Linear(DIM_EMBED, NUM_HEADS * DIM_HEAD_PROJ) = Linear(512, 256)
+DIM_HEAD_PROJ = 128
+NORM_EPS = 1e-5
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 SEED = 0
 
 RECORD_MEMORY_HISTORY = True
-MEMORY_SNAPSHOT_PATH = "flash_attn_memory_snapshot.pickle"
+
+MEMORY_SNAPSHOT_PATH = f"flash_attn_memory_snapshot_{time.time()}.pickle"
 # ring buffer of allocator events, not a time span: once it wraps, the snapshot
 # keeps only the tail of the run.
 MEMORY_HISTORY_MAX_ENTRIES = 100_000
@@ -52,25 +74,59 @@ def stop_memory_history():
         torch.cuda.memory._record_memory_history(enabled=None)
 
 
-def report_peak_memory():
-    """Print the high-water marks of the CUDA caching allocator.
+class RMSNorm(nn.Module):
+    """WG's `norms.RMSNorm`, trimmed to the parameter-free case the attention blocks use.
 
-    allocated = memory actually held by live tensors; reserved = memory the
-    allocator took from the driver, so reserved - allocated is cache/fragmentation.
+    `F.rms_norm` carries no autocast registration, so it runs in the dtype it is given,
+    and where a fused kernel exists its backward keeps the bf16 input plus a per-row
+    rstd instead of a float32 copy. That is why WG prefers it to LayerNorm here, so it
+    is the part worth reproducing.
     """
-    gib = 1024**3
-    print(
-        f"peak memory: allocated {torch.cuda.max_memory_allocated() / gib:.3f} GiB, "
-        f"reserved {torch.cuda.max_memory_reserved() / gib:.3f} GiB"
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.normalized_shape = (dim,)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x, self.normalized_shape, None, self.eps)
+
+
+def norm_in_input_dtype(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Apply `norm` to `x` and return the result in the dtype of `x` (WG's `norms.py`)."""
+    return norm(x).to(x.dtype)
+
+
+class AttentionPrologue(nn.Module):
+    """q/k/v as `MultiSelfAttentionHead*.forward` builds them, minus rope and dropout."""
+
+    def __init__(self):
+        super().__init__()
+        self.proj_heads_q = nn.Linear(DIM_EMBED, NUM_HEADS * DIM_HEAD_PROJ, bias=False)
+        self.proj_heads_k = nn.Linear(DIM_EMBED, NUM_HEADS * DIM_HEAD_PROJ, bias=False)
+        self.proj_heads_v = nn.Linear(DIM_EMBED, NUM_HEADS * DIM_HEAD_PROJ, bias=False)
+        self.lnorm_q = RMSNorm(DIM_HEAD_PROJ, eps=NORM_EPS)
+        self.lnorm_k = RMSNorm(DIM_HEAD_PROJ, eps=NORM_EPS)
+        self.num_heads = NUM_HEADS
+        self.dtype = DTYPE
+
+    def forward(self, x):
+        s = [*([x.shape[0], 1] if len(x.shape) == 2 else x.shape[:-1]), self.num_heads, -1]
+        qs = norm_in_input_dtype(self.lnorm_q, self.proj_heads_q(x).reshape(s)).to(self.dtype)
+        ks = norm_in_input_dtype(self.lnorm_k, self.proj_heads_k(x).reshape(s)).to(self.dtype)
+        vs = self.proj_heads_v(x).reshape(s).to(self.dtype)
+        return qs, ks, vs
+
+
+def build_input():
+    """The block input the projections read, as a leaf so backward reaches it."""
+    return torch.randn(
+        (BATCH_SIZE, SEQ_LEN, DIM_EMBED), device=DEVICE, dtype=DTYPE, requires_grad=True
     )
 
 
-def build_qkv():
-    """Three leaf tensors in flash_attn_func's layout, one per q/k/v."""
-    return [
-        torch.randn(QKV_SHAPE, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        for _ in range(3)
-    ]
+def build_model():
+    return AttentionPrologue().to(device=DEVICE, dtype=DTYPE)
 
 
 def run():
@@ -80,17 +136,18 @@ def run():
 
     torch.manual_seed(SEED)
 
-    q, k, v = build_qkv()
-    # allocate the inputs before resetting, so the report covers the pass only
+    x = build_input()
+    model = build_model()
     torch.cuda.reset_peak_memory_stats()
-    
+
     try:
-        out = flash_attn_func(q, k, v)
+        qs, ks, vs = model(x)
+        out = flash_attn_func(qs, ks, vs)
         # older flash_attn_interface builds return (out, softmax_lse)
         if isinstance(out, tuple):
             out = out[0]
 
-        # stands in for a loss: any scalar will do, the gradients land on q/k/v
+        # stands in for a loss: any scalar will do, the gradients land on x and the weights
         loss = out.mean()
         loss.backward()
 
@@ -98,7 +155,6 @@ def run():
     finally:
         # in finally so an OOM -- the usual reason for recording -- still dumps
         stop_memory_history()
-        report_peak_memory()
 
 
 if __name__ == "__main__":
