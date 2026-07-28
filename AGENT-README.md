@@ -36,8 +36,13 @@ diff by eye.
 ## Running
 
 `uv sync`, then `uv run python train.py`. Never `pip install` into the env — it
-bypasses the lock. Defaults are CPU-only and finish in seconds; keep it that way, and
-put anything GPU-specific behind the `DEVICE` knob.
+bypasses the lock. `DEVICE` auto-selects CUDA when it is available and falls back to
+CPU otherwise; the workload is tiny either way and finishes in seconds. Keep it that
+way, and gate anything GPU-specific on `ON_CUDA` (derived from `DEVICE`, so setting
+`DEVICE = "cpu"` on a GPU box disables it) rather than on `torch.cuda.is_available()`.
+
+Peak allocator usage (max allocated / max reserved) is printed after the loop on CUDA.
+The fuller allocator trace stays behind `RECORD_MEMORY_HISTORY`.
 
 This repo sits nested inside a WeatherGenerator checkout, whose `[tool.uv]`
 `exclude-newer` setting leaks in and breaks torch resolution. Pass `--no-config` to

@@ -41,7 +41,7 @@ def start_memory_history():
 
 def stop_memory_history():
     """Dump the snapshot and stop recording. View at https://docs.pytorch.org/memory_viz."""
-    if not (RECORD_MEMORY_HISTORY and torch.cuda.is_available()):
+    if not (RECORD_MEMORY_HISTORY and ON_CUDA):
         return
     try:
         torch.cuda.memory._dump_snapshot(MEMORY_SNAPSHOT_PATH)
@@ -54,7 +54,7 @@ def stop_memory_history():
 
 def reset_peak_memory():
     """Zero the allocator's peak counters so the report covers the loop only."""
-    if not torch.cuda.is_available():
+    if not ON_CUDA:
         return
     torch.cuda.reset_peak_memory_stats()
 
@@ -65,7 +65,7 @@ def report_peak_memory():
     allocated = memory actually held by live tensors; reserved = memory the
     allocator took from the driver, so reserved - allocated is cache/fragmentation.
     """
-    if not torch.cuda.is_available():
+    if not ON_CUDA:
         return
     gib = 1024**3
     print(
