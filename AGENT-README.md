@@ -14,8 +14,9 @@ memory and profiling experiments can be tried here before porting to
 - `flash_attn_experiment.py` — WG's attention prologue (three `Linear(512, 256)` head
   projections + `RMSNorm` on q/k, mirroring `WeatherGenerator`'s `attention.py`) feeding
   one `flash_attn_func` forward+backward, wrapped in an allocator trace that dumps a
-  timestamped `flash_attn_memory_snapshot_*.pickle`. CUDA-only (FlashAttention-3), so it
-  does not run on the CPU default.
+  timestamped `flash_attn_memory_snapshot_*.pickle`. `CHECKPOINT_PROLOGUE` toggles
+  activation checkpointing of the prologue, and tags the snapshot name with the mode.
+  CUDA-only (FlashAttention-3), so it does not run on the CPU default.
 - `agent_docs/` — detailed notes, indexed below. Not auto-loaded; read when relevant.
 - `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch, numpy, astropy-healpix).
 

@@ -3,7 +3,8 @@
 Forward + backward over the part of `MultiSelfAttentionHead*.forward` that feeds
 the kernel: three head projections off the same input, RMSNorm on q and k, then
 `flash_attn_func`. No output projection, no residual -- the point of this file is
-the pickle it drops, not the loss it prints.
+the pickle it drops, not the loss it prints. `CHECKPOINT_PROLOGUE` recomputes the
+prologue in the backward pass; the snapshot filename records which way it ran.
 
 Shapes and modules mirror `WeatherGenerator/src/weathergen/model/attention.py`
 (and `norms.py`); `RMSNorm` is copied here rather than imported so this sandbox
@@ -24,6 +25,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from flash_attn_interface import flash_attn_func
 
@@ -42,9 +44,16 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 SEED = 0
 
+# recompute the prologue in the backward pass instead of keeping its internals.
+# What this actually buys is the two pre-RMSNorm projections (q and k) and their
+# rstd buffers: qs/ks/vs are inputs to flash attention's backward and x is the
+# block input, so both stay live either way. Run it both ways and diff the peaks.
+CHECKPOINT_PROLOGUE = True
+
 RECORD_MEMORY_HISTORY = True
 
-MEMORY_SNAPSHOT_PATH = f"flash_attn_memory_snapshot_{time.time()}.pickle"
+_TAG = "ckpt" if CHECKPOINT_PROLOGUE else "nockpt"
+MEMORY_SNAPSHOT_PATH = f"flash_attn_memory_snapshot_{_TAG}_{time.time()}.pickle"
 # ring buffer of allocator events, not a time span: once it wraps, the snapshot
 # keeps only the tail of the run.
 MEMORY_HISTORY_MAX_ENTRIES = 100_000
@@ -141,7 +150,10 @@ def run():
     torch.cuda.reset_peak_memory_stats()
 
     try:
-        qs, ks, vs = model(x)
+        # use_reentrant=False to match how WG wraps its blocks
+        qs, ks, vs = (
+            checkpoint(model, x, use_reentrant=False) if CHECKPOINT_PROLOGUE else model(x)
+        )
         out = flash_attn_func(qs, ks, vs)
         # older flash_attn_interface builds return (out, softmax_lse)
         if isinstance(out, tuple):
