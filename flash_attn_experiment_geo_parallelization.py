@@ -24,6 +24,20 @@ before the forward pass, so GPU r only ever holds and computes on its ~B/4 rows.
 The full-shape mask still gets used, on the way back, to scatter each rank's
 output into the right rows of the reassembled `[B, S, H, D]` tensor.
 
+Loss and verification
+---------------------
+The shards are put back together with an *autograd-aware* all_gather
+(`torch.distributed.nn.functional.all_gather`), and the loss is taken on that
+reassembled full-batch output rather than per shard -- so the backward pass runs
+through the collective and every rank sees the same global loss.
+
+With `VERIFY_AGAINST_FULL_BATCH`, rank 0 additionally reruns the identical
+forward on the *whole* batch on its own GPU and asserts the gathered tensor is
+bit-identical to it, before either goes near the loss. That is a correctness
+check on the partitioning, not part of the workload: it makes rank 0 hold the
+full-batch activations, so turn it off when the point of the run is the memory
+profile.
+
 Requires 4 CUDA (Hopper) devices across one process group. Launch with `srun`,
 one Python process per GPU; each process reads its rank from Slurm's environment
 and joins the `nccl` process group directly.
@@ -36,6 +50,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+# autograd-aware all_gather. torch 2.13 warns that this is deprecated in favour of
+# `torch.distributed._functional_collectives.all_gather_single_autograd`, but that one
+# is a private module; keep the public spelling until the clusters force the move.
+from torch.distributed.nn.functional import all_gather as all_gather_autograd
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 
@@ -54,6 +72,9 @@ SEED = 0
 WORLD_SIZE = 4
 
 CHECKPOINT_PROLOGUE = True
+# rank 0 reruns the forward on the full batch and compares against the gathered
+# shards. Costs rank 0 the full-batch activations -- set False for clean profiles.
+VERIFY_AGAINST_FULL_BATCH = True
 RECORD_MEMORY_HISTORY = True
 MEMORY_HISTORY_MAX_ENTRIES = 100_000
 
@@ -138,6 +159,79 @@ def build_model_cpu() -> AttentionPrologue:
     return AttentionPrologue().to(dtype=DTYPE)
 
 
+def forward_prologue_attention(
+    module: nn.Module, x: torch.Tensor, *, checkpoint_prologue: bool
+) -> torch.Tensor:
+    """Prologue projections + flash attention: the one forward both paths run.
+
+    Sharing it is the point -- rank 0's full-batch reference has to be the same
+    code as the per-shard forward for the bit-identity check to mean anything.
+    Checkpointing changes only what gets stored for backward, not the values.
+    """
+    qs, ks, vs = (
+        checkpoint(module, x, use_reentrant=False) if checkpoint_prologue else module(x)
+    )
+    out = flash_attn_func(qs, ks, vs)
+    return out[0] if isinstance(out, tuple) else out
+
+
+# --- gather + verification -----------------------------------------------------
+
+
+def gather_full_output(
+    out_local: torch.Tensor, masks: dict[int, torch.Tensor], world_size: int
+) -> torch.Tensor:
+    """all_gather every rank's shard and scatter it back into full batch order.
+
+    `all_gather` wants equal shapes, and the shards differ by at most one row, so
+    each rank pads to `max(sizes)` and the padding is sliced off again on arrival.
+    The gather is the autograd-aware one, so the loss taken on the returned tensor
+    backpropagates through the collective into each rank's own shard: its backward
+    is a reduce_scatter(SUM), which sums the (identical) per-rank gradients, and
+    DDP's gradient averaging divides by the same world size again -- so the
+    parameter gradients match a single-GPU `out.mean().backward()` on the full batch.
+    """
+    device = out_local.device
+    sizes = [int(masks[r].sum().item()) for r in range(world_size)]
+    local_size = out_local.shape[0]
+
+    padded = out_local.new_zeros((max(sizes), SEQ_LEN, NUM_HEADS, DIM_HEAD_PROJ))
+    padded[:local_size] = out_local
+    gathered = all_gather_autograd(padded)
+
+    full_out = out_local.new_zeros((BATCH_SIZE, SEQ_LEN, NUM_HEADS, DIM_HEAD_PROJ))
+    for r in range(world_size):
+        idx = masks[r].nonzero(as_tuple=True)[0].to(device)
+        full_out[idx] = gathered[r][: sizes[r]]
+    return full_out
+
+
+def verify_against_full_batch(
+    module: nn.Module, x_full_cpu: torch.Tensor, full_out: torch.Tensor, device: torch.device
+):
+    """Rerun the forward on the whole batch here and assert the gather matches it exactly.
+
+    Only called on rank 0, and only for the check -- the full-batch activations it
+    allocates are exactly what the partitioning exists to avoid.
+    """
+    x_full = x_full_cpu.to(device, non_blocking=True)
+    with torch.no_grad():
+        out_ref = forward_prologue_attention(module, x_full, checkpoint_prologue=False)
+    del x_full
+
+    got = full_out.detach()
+    if torch.equal(got, out_ref):
+        print(f"verification: gathered {tuple(got.shape)} is bit-identical to the full-batch forward")
+        return
+
+    mismatched = int((got != out_ref).sum().item())
+    max_abs_diff = (got.float() - out_ref.float()).abs().max().item()
+    raise AssertionError(
+        f"gathered output differs from the full-batch forward: {mismatched} / {got.numel()} "
+        f"elements mismatch, max abs diff {max_abs_diff:.3e}"
+    )
+
+
 # --- memory history helpers (per rank) ---------------------------------------
 
 
@@ -216,45 +310,31 @@ def worker(rank: int, local_rank: int, world_size: int):
     start_memory_history(rank)
 
     try:
-        qs, ks, vs = (
-            checkpoint(model, x_local, use_reentrant=False)
-            if CHECKPOINT_PROLOGUE
-            else model(x_local)
+        out_local = forward_prologue_attention(
+            model, x_local, checkpoint_prologue=CHECKPOINT_PROLOGUE
         )
-        out_local = flash_attn_func(qs, ks, vs)
-        if isinstance(out_local, tuple):
-            out_local = out_local[0]
 
-        loss_local = out_local.mean()
-        loss_local.backward()
+        # reassemble the full [B, S, H, D] block on every rank; differentiable, so
+        # this stays on the path from the loss back to each rank's own shard.
+        full_out = gather_full_output(out_local, masks, world_size)
 
-        # average the per-rank losses just for a sane printed number; each rank's
-        # loss came from a different-sized shard so this is a weighted-by-nothing
-        # mean, not a true global mean -- fine for a memory profile, not for training.
-        loss_tensor = loss_local.detach().clone()
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        peak_forward = torch.cuda.max_memory_allocated(device) / 2**20
+
+        # rank 0 checks the partition reproduces the unsharded forward exactly,
+        # while the other ranks wait for it at the first collective in backward.
+        if VERIFY_AGAINST_FULL_BATCH and rank == 0:
+            verify_against_full_batch(model.module, x_full_cpu, full_out, device)
+
+        loss = full_out.mean()
+        loss.backward()
         if rank == 0:
-            print(f"mean local loss across ranks: {loss_tensor.item():.6f}")
+            print(f"loss on the gathered full batch: {loss.item():.6f}")
 
         peak = torch.cuda.max_memory_allocated(device) / 2**20
-        print(f"[rank {rank}] shard size {local_size}, peak allocated {peak:.1f} MiB")
-
-        # --- reassemble the full [B, S, H, D] output on rank 0, using the masks ---
-        sizes = [masks[r].sum().item() for r in range(world_size)]
-        max_size = max(sizes)
-        padded = out_local.new_zeros((max_size, SEQ_LEN, NUM_HEADS, DIM_HEAD_PROJ))
-        padded[:local_size] = out_local
-        gather_list = [torch.empty_like(padded) for _ in range(world_size)]
-        dist.all_gather(gather_list, padded)
-
-        if rank == 0:
-            full_out = torch.zeros(
-                BATCH_SIZE, SEQ_LEN, NUM_HEADS, DIM_HEAD_PROJ, dtype=out_local.dtype
-            )
-            for r in range(world_size):
-                idx = masks[r].nonzero(as_tuple=True)[0]
-                full_out[idx] = gather_list[r][: sizes[r]].to(full_out.device)
-            print(f"reassembled output shape: {tuple(full_out.shape)}")
+        print(
+            f"[rank {rank}] shard size {local_size}, peak allocated {peak:.1f} MiB "
+            f"(pre-backward {peak_forward:.1f} MiB)"
+        )
     finally:
         stop_memory_history(rank)
         dist.barrier()

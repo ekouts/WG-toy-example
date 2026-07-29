@@ -59,3 +59,30 @@ script now exports only `MASTER_ADDR`/`MASTER_PORT` and runs
 **Verdict:** Ready to rerun with `sbatch submission_file_jureca.sh`. This edit was
 syntax-checked only; it still needs verification inside a GPU allocation.
 
+## 2026-07-29 — Gather-then-loss and a bit-identity check against the unsharded forward
+
+**Question:** Does the mask partition in
+`flash_attn_experiment_geo_parallelization.py` actually reproduce the unsharded
+forward, and can the loss be taken on the reassembled batch instead of per shard?
+
+**Setup:** Replaced the `all_reduce` of the per-shard losses with an autograd-aware
+`all_gather` (`torch.distributed.nn.functional.all_gather`) of the per-shard
+`[B_r, S, H, D]` outputs, scattered back into batch order through the rank masks.
+The loss is now `full_out.mean()` on every rank, so backward runs through the
+collective. Under `VERIFY_AGAINST_FULL_BATCH`, rank 0 reruns the identical forward
+(shared helper `forward_prologue_attention`) on the whole batch and asserts
+`torch.equal` against the gathered tensor before the loss sees it.
+
+**Result:** Verified on CPU with 4 gloo ranks and a stubbed `flash_attn_func`
+(SDPA), uneven shards (B=34, world 4), fp32: the gathered output is bit-identical
+to the single-process full-batch forward, the loss matches it exactly, and the
+parameter gradients match to ~3e-9 with norm ratio 1.0 — no leftover world-size
+factor. That last part is the non-obvious bit: `all_gather`'s backward is a
+`reduce_scatter(SUM)` over the four identical per-rank losses, and DDP's gradient
+averaging divides by the same world size, so the two cancel.
+
+**Verdict:** Plumbing is correct; the bit-identity claim still needs a run on real
+GPUs with FlashAttention-3 in bf16, where cuBLAS may pick different kernels for the
+shard-sized and full-batch GEMMs. Set `VERIFY_AGAINST_FULL_BATCH = False` for memory
+profiling runs — the check puts the full-batch activations back on rank 0.
+

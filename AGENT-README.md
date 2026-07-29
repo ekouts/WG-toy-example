@@ -20,7 +20,12 @@ memory and profiling experiments can be tried here before porting to
 - `flash_attn_experiment_geo_parallelization.py` — 4-GPU mask-partitioned version of
   the flash-attn prologue experiment. Launch with Slurm `srun`, one Python process
   per GPU; ranks come from Slurm environment variables rather than
-  `torch.multiprocessing.spawn`.
+  `torch.multiprocessing.spawn`. The shards are reassembled with an autograd-aware
+  `all_gather` and the loss is taken on that full-batch output, so backward runs
+  through the collective. `VERIFY_AGAINST_FULL_BATCH` makes rank 0 rerun the same
+  forward on the whole batch and assert the gathered tensor is bit-identical before
+  the loss — a correctness check, and it puts the full-batch activations back on
+  rank 0, so switch it off when you are profiling memory.
 - `agent_docs/` — detailed notes, indexed below. Not auto-loaded; read when relevant.
 - `pyproject.toml`, `uv.lock` — deps (Python 3.12, torch, numpy, astropy-healpix).
 
