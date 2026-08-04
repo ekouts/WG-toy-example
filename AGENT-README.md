@@ -17,10 +17,11 @@ memory and profiling experiments can be tried here before porting to
   timestamped `flash_attn_memory_snapshot_*.pickle`. `CHECKPOINT_PROLOGUE` toggles
   activation checkpointing of the prologue, and tags the snapshot name with the mode.
   CUDA-only (FlashAttention-3), so it does not run on the CPU default.
-- `flash_attn_experiment_geo_parallelization.py` — 4-GPU mask-partitioned version of
-  the flash-attn prologue experiment. Launch with Slurm `srun`, one Python process
-  per GPU; ranks come from Slurm environment variables rather than
-  `torch.multiprocessing.spawn`. The shards are reassembled with an autograd-aware
+- `flash_attn_experiment_geo_parallelization.py` — mask-partitioned version of
+  the flash-attn prologue experiment, normally 4 GPUs. Launch with Slurm `srun`, one
+  Python process per GPU; rank, local rank and world size come from Slurm environment
+  variables rather than `torch.multiprocessing.spawn`, so the task count alone sets
+  the split — `--ntasks-per-node=1` runs the same code path unsharded, with no edit. The shards are reassembled with an autograd-aware
   `all_gather` and the loss is taken on that full-batch output, so backward runs
   through the collective. `VERIFY_AGAINST_FULL_BATCH` makes rank 0 rerun the same
   forward on the whole batch and assert the gathered tensor is bit-identical before

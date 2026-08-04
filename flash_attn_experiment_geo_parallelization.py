@@ -1,4 +1,4 @@
-"""4-GPU, mask-partitioned version of the single-GPU attention prologue + flash_attn_func script.
+"""Mask-partitioned version of the single-GPU attention prologue + flash_attn_func script.
 
 Same math as the original: three head projections off the same input, RMSNorm on
 q and k, then `flash_attn_func`. The difference is how the batch dimension gets
@@ -6,9 +6,9 @@ to each GPU.
 
 Partitioning strategy
 ----------------------
-`build_rank_masks(BATCH_SIZE, WORLD_SIZE)` returns a dict {rank: mask} where each
+`build_rank_masks(BATCH_SIZE, world_size)` returns a dict {rank: mask} where each
 `mask` is a `(BATCH_SIZE,)` bool tensor -- 1 where that row belongs to `rank`, 0
-elsewhere, and the four masks partition [0, BATCH_SIZE) exactly (every row goes to
+elsewhere, and the masks partition [0, BATCH_SIZE) exactly (every row goes to
 exactly one rank). `expand_mask(mask, shape)` turns that into a broadcastable view
 over the full `[BATCH_SIZE, SEQ_LEN, NUM_HEADS, DIM_HEAD_PROJ]` shape -- via
 `.view(-1, 1, 1, 1).expand(shape)`, which is stride-0 and allocates nothing, so you
@@ -38,9 +38,10 @@ check on the partitioning, not part of the workload: it makes rank 0 hold the
 full-batch activations, so turn it off when the point of the run is the memory
 profile.
 
-Requires 4 CUDA (Hopper) devices across one process group. Launch with `srun`,
-one Python process per GPU; each process reads its rank from Slurm's environment
-and joins the `nccl` process group directly.
+Requires CUDA (Hopper) devices. Launch with `srun`, one Python process per GPU;
+each process reads its rank, local rank and world size from Slurm's environment
+and joins the `nccl` process group directly. Any task count works -- 4 tasks for
+the intended 4-way split, 1 task to run the same code path unsharded.
 """
 
 import os
@@ -69,7 +70,9 @@ NORM_EPS = 1e-5
 DTYPE = torch.bfloat16
 SEED = 0
 
-WORLD_SIZE = 4
+# World size comes from the launcher (`SLURM_NTASKS` / `WORLD_SIZE`), not a constant --
+# the partitioning works for any rank count, including 1, which is the degenerate
+# single-GPU case: one all-True mask and an all_gather that passes its input through.
 
 CHECKPOINT_PROLOGUE = True
 # rank 0 reruns the forward on the full batch and compares against the gathered
@@ -348,11 +351,6 @@ def run():
     rank = env_int("SLURM_PROCID", "RANK")
     local_rank = env_int("SLURM_LOCALID", "LOCAL_RANK", default=rank)
     world_size = env_int("SLURM_NTASKS", "WORLD_SIZE")
-    if world_size != WORLD_SIZE:
-        raise RuntimeError(
-            f"configured for {WORLD_SIZE} ranks, but launcher provided {world_size}; "
-            "update WORLD_SIZE or launch with the matching number of srun tasks"
-        )
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
