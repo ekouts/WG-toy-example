@@ -21,7 +21,11 @@ memory and profiling experiments can be tried here before porting to
   the flash-attn prologue experiment, normally 4 GPUs. Launch with Slurm `srun`, one
   Python process per GPU; rank, local rank and world size come from Slurm environment
   variables rather than `torch.multiprocessing.spawn`, so the task count alone sets
-  the split — `--ntasks-per-node=1` runs the same code path unsharded, with no edit. The shards are reassembled with an autograd-aware
+  the split — `--ntasks-per-node=1` runs the same code path unsharded, with no edit.
+  World size 1 short-circuits every distributed step (no process group, no DDP wrap,
+  no batch split, gather returns its input), so it is a genuine single-GPU baseline
+  rather than a one-rank distributed run, and `VERIFY_AGAINST_FULL_BATCH` is skipped
+  there because there is no partition to check. The shards are reassembled with an autograd-aware
   `all_gather` and the loss is taken on that full-batch output, so backward runs
   through the collective. `VERIFY_AGAINST_FULL_BATCH` makes rank 0 rerun the same
   forward on the whole batch and assert the gathered tensor is bit-identical before

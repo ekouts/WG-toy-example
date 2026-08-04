@@ -42,6 +42,13 @@ Requires CUDA (Hopper) devices. Launch with `srun`, one Python process per GPU;
 each process reads its rank, local rank and world size from Slurm's environment
 and joins the `nccl` process group directly. Any task count works -- 4 tasks for
 the intended 4-way split, 1 task to run the same code path unsharded.
+
+World size 1 is a true single-GPU baseline, not a one-rank distributed run: no
+process group is created, the model is not DDP-wrapped, the batch is not split
+(advanced indexing would copy it) and the gather returns its input untouched. The
+only thing left is the prologue + flash attention, so the memory profile it
+produces is comparable against `flash_attn_experiment.py` rather than carrying
+NCCL buffers, DDP buckets and three redundant full-batch allocations.
 """
 
 import os
@@ -301,12 +308,21 @@ def select_cuda_device(local_rank: int) -> torch.device:
 
 def worker(rank: int, local_rank: int, world_size: int):
     device = select_cuda_device(local_rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    # At world 1 there is nothing to communicate, so no process group is created at
+    # all: NCCL reserves communicator buffers on the device (outside the PyTorch
+    # allocator, so they never show up in max_memory_allocated but do eat HBM), and
+    # a single-rank run exists precisely to be a clean unsharded baseline.
+    distributed = world_size > 1
+    if distributed:
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     # every rank builds the identical full-batch input and identical initial weights
     x_full_cpu = build_input_cpu()
-    model = build_model_cpu().to(device)
-    model = DDP(model, device_ids=[device.index])
+    core_model = build_model_cpu().to(device)
+    # DDP's gradient all-reduce is a no-op at world 1, but it still allocates buckets
+    # and registers autograd hooks -- skip the wrapper so single-rank is plain single-GPU.
+    model = DDP(core_model, device_ids=[device.index]) if distributed else core_model
 
     masks = build_rank_masks(BATCH_SIZE, world_size)
     local_indices = masks[rank].nonzero(as_tuple=True)[0]
@@ -331,19 +347,26 @@ def worker(rank: int, local_rank: int, world_size: int):
 
         # reassemble the full [B, S, H, D] block on every rank; differentiable, so
         # this stays on the path from the loss back to each rank's own shard.
+        # No-op at world 1, where the local output already is the full batch.
         full_out = gather_full_output(out_local, masks, world_size)
 
         peak_forward = torch.cuda.max_memory_allocated(device) / 2**20
 
         # rank 0 checks the partition reproduces the unsharded forward exactly,
         # while the other ranks wait for it at the first collective in backward.
+        # There is no partition to check at world 1, and the "reference" would be a
+        # rerun of the same function on the same rows -- so it is skipped rather than
+        # run as a self-comparison that prints a bit-identity claim meaning nothing.
         if VERIFY_AGAINST_FULL_BATCH and rank == 0:
-            verify_against_full_batch(model.module, x_full_cpu, full_out, device)
+            if distributed:
+                verify_against_full_batch(core_model, x_full_cpu, full_out, device)
+            else:
+                print("verification: skipped at world size 1 -- nothing is sharded")
 
         loss = full_out.mean()
         loss.backward()
         if rank == 0:
-            print(f"loss on the gathered full batch: {loss.item():.6f}")
+            print(f"loss on the full batch: {loss.item():.6f}")
 
         peak = torch.cuda.max_memory_allocated(device) / 2**20
         print(
@@ -352,8 +375,9 @@ def worker(rank: int, local_rank: int, world_size: int):
         )
     finally:
         stop_memory_history(rank)
-        dist.barrier()
-        dist.destroy_process_group()
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 def run():

@@ -102,10 +102,37 @@ tensor is bit-identical to a direct full-batch forward, and `mean().backward()` 
 runs through the collective (the world-1 `all_gather` passes its input through). Slurm
 side is just `--ntasks-per-node=1 --gres=gpu:1`.
 
-**Verdict:** Single-rank runs need no code edit now, only the task count. Note the
-baseline is weaker than the 4-rank one: at world 1 `VERIFY_AGAINST_FULL_BATCH` compares
-the batch against itself, so it no longer tests the partitioning — it only catches a
-checkpointed-vs-uncheckpointed discrepancy. Not yet run on Santis;
-`submission_file_santis.sh` still sources a JURECA venv path (`/p/project1/...`) that
-does not exist there and has to be fixed before any Santis run.
+**Verdict:** Single-rank runs need no code edit now, only the task count. Not yet run
+on Santis; `submission_file_santis.sh` still sources a JURECA venv path
+(`/p/project1/...`) that does not exist there and has to be fixed before any Santis
+run. Follow-up below removed the leftover distributed work at world 1.
+
+## 2026-08-04 — Make world size 1 a real single-GPU baseline
+
+**Question:** With the world size now coming from the launcher, a 1-task run still went
+through the whole distributed machinery. What does that cost, and does any of it need
+to happen?
+
+**Setup:** At world 1 the script was still creating a NCCL process group, DDP-wrapping
+the model, splitting the batch via `x_full_cpu[local_indices]`, and running
+`gather_full_output`. None of it does anything at one rank, but all of it allocates:
+advanced indexing always copies (a second full batch on the host), the gather builds a
+`padded` buffer, an all_gather output list and a zeroed `full_out` to scatter into
+(three full-batch GPU allocations), DDP builds gradient buckets and autograd hooks, and
+the NCCL communicator reserves device buffers *outside* the PyTorch allocator — so they
+never appear in `max_memory_allocated` but do consume HBM. Guarded all four on
+`world_size > 1`, and skip `VERIFY_AGAINST_FULL_BATCH` at world 1 rather than let it
+print a bit-identity claim from comparing a tensor against a rerun on the same rows.
+
+**Result:** Verified on CPU with a stubbed `flash_attn_func` (SDPA), B=34, fp32, by
+wrapping `torch.distributed` and counting calls: world 1 makes **zero** collective
+calls (no `init_process_group`, no `all_gather`, no `barrier`), world 4 still makes
+`all_gather` + `barrier` + `destroy_process_group` per rank and still passes the
+bit-identity check. Both report the same loss, 0.015902 — the sharded and unsharded
+paths agree exactly. Caveat: DDP was stubbed to identity in that CPU harness, so this
+run did not re-exercise gradient averaging (covered by the 2026-07-29 entry).
+
+**Verdict:** World 1 is now a clean unsharded baseline whose memory profile is
+comparable against `flash_attn_experiment.py`, instead of one carrying NCCL buffers,
+DDP buckets and three redundant full-batch allocations. Still CPU-verified only.
 
