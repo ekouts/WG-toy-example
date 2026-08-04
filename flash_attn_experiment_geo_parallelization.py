@@ -74,7 +74,7 @@ SEED = 0
 # the partitioning works for any rank count, including 1, which is the degenerate
 # single-GPU case: one all-True mask and an all_gather that passes its input through.
 
-CHECKPOINT_PROLOGUE = True
+CHECKPOINT_PROLOGUE = False
 # rank 0 reruns the forward on the full batch and compares against the gathered
 # shards. Costs rank 0 the full-batch activations -- set False for clean profiles.
 VERIFY_AGAINST_FULL_BATCH = True
@@ -193,7 +193,15 @@ def gather_full_output(
     is a reduce_scatter(SUM), which sums the (identical) per-rank gradients, and
     DDP's gradient averaging divides by the same world size again -- so the
     parameter gradients match a single-GPU `out.mean().backward()` on the full batch.
+
+    At world size 1 the shard *is* the full batch, so this returns it untouched: no
+    padding buffer, no collective, no zeroed `full_out` to scatter into. Those three
+    full-batch allocations would otherwise show up in a single-rank memory profile as
+    pure launcher overhead.
     """
+    if world_size == 1:
+        return out_local
+
     device = out_local.device
     sizes = [int(masks[r].sum().item()) for r in range(world_size)]
     local_size = out_local.shape[0]
@@ -301,12 +309,16 @@ def worker(rank: int, local_rank: int, world_size: int):
     model = DDP(model, device_ids=[device.index])
 
     masks = build_rank_masks(BATCH_SIZE, world_size)
-    local_mask = masks[rank]
-    local_indices = local_mask.nonzero(as_tuple=True)[0]
+    local_indices = masks[rank].nonzero(as_tuple=True)[0]
     local_size = local_indices.numel()
 
-    # select this rank's rows and move only those to this GPU
-    x_local = x_full_cpu[local_indices].to(device, non_blocking=True)
+    if world_size == 1:
+        # this rank owns every row, so skip the split: advanced indexing always
+        # copies, and at world 1 that copy is a second full batch on the host.
+        x_local = x_full_cpu.to(device, non_blocking=True)
+    else:
+        # select this rank's rows and move only those to this GPU
+        x_local = x_full_cpu[local_indices].to(device, non_blocking=True)
     x_local = x_local.detach().requires_grad_(True)
 
     torch.cuda.reset_peak_memory_stats(device)
