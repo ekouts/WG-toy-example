@@ -15,6 +15,4 @@ MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
 export MASTER_ADDR="${MASTER_ADDR}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
-source /p/project1/cjsc/kasravi1/WeatherGenerator/.venv/bin/activate
-
 srun --export=ALL python flash_attn_experiment_geo_parallelization.py
